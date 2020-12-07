@@ -118,7 +118,7 @@ int main(int argc, char * argv[])
         }
         printf("sum: %f\n", sum);
         printf("diff: %f\n", abs(diff));
-        printf("error ratio: %f\n", abs(diff) / sum);
+        printf("diff to sum ratio: %f\n", abs(diff) / sum);
     
         // print_fmap(ofmap_cpu, ofmap_shape);
         // print_fmap(ofmap_gpu, ofmap_shape);
@@ -231,8 +231,8 @@ void deconv_kernel_tile_ifmap(float * ifmap, float * filter, float * ofmap,
         for (int k1=0; k1<filter_shape.K; ++k1) {
             int output_y = w0*2+k0-pad;
             int output_x = w1*2+k1-pad;
-            for (int m=0; m<filter_shape.M; ++m) {
-                if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
+            if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W) {
+                for (int m=0; m<filter_shape.M; ++m) {
                     unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
                     unsigned int ofmap_index = get_fmap_index(m, output_y, output_x, ofmap_shape);
                     
