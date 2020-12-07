@@ -45,6 +45,9 @@ __global__ void deconv_kernel_tile(float *, float *, float *, FmapShape, FilterS
 
 /*****************************************************************/
 
+// to measure time taken by a specific part of the code 
+double time_taken;
+clock_t start, end;
 
 int main(int argc, char * argv[])
 {
@@ -79,11 +82,6 @@ int main(int argc, char * argv[])
     /* The 3D array of points will be treated as 1D array of CxWxW elements */
     float * ifmap, * filter, * ofmap_cpu, * ofmap_gpu; 
     
-    // to measure time taken by a specific part of the code 
-    double time_taken;
-    clock_t start, end;
-    
-    
     /* Dynamically allocate NxN array of floats */
     ifmap = (float *)calloc(C*W*W, sizeof(float));
     filter = (float *)calloc(C*M*K*K, sizeof(float));
@@ -107,22 +105,10 @@ int main(int argc, char * argv[])
     //     ofmap_gpu[i] = 0.0;
 
 
-    printf("CPU start\n");
-    start = clock();
     cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
-    end = clock();
-    printf("CPU end\n");
-    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
-    printf("Time taken for CPU is %lf\n", time_taken);
     
-    printf("GPU start\n");
-    start = clock();
     // gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape);
     gpu_deconv_tile(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape);
-    end = clock();
-    printf("GPU end\n");
-    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
-    printf("Time taken for GPU is %lf\n", time_taken);
 
     double diff = 0, sum = 0;
     for (int i=0; i<4*M*W*W; i++) {
@@ -148,6 +134,9 @@ int main(int argc, char * argv[])
 void cpu_deconv(float * ifmap, float * filter, float * ofmap, 
                                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
 {
+    printf("CPU start\n");
+    start = clock();
+
     // assuming stride is always 2, batch size is always 1
     unsigned int pad = (filter_shape.K - 1) / 2;
     for (int c=0; c<ifmap_shape.C; c++){
@@ -170,6 +159,11 @@ void cpu_deconv(float * ifmap, float * filter, float * ofmap,
             }
         }
     }
+    
+    end = clock();
+    printf("CPU end\n");
+    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
+    printf("Time taken for CPU is %lf\n", time_taken);
 }
 
 __global__ void deconv_kernel(float * ifmap, float * filter, float * ofmap, 
@@ -201,6 +195,9 @@ __global__ void deconv_kernel(float * ifmap, float * filter, float * ofmap,
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
     FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
 {
+    printf("GPU start\n");
+    start = clock();
+
     float * d_ifmap, * d_filter, * d_ofmap;
     size_t ifmap_size = ifmap_shape.C*ifmap_shape.W*ifmap_shape.W*sizeof(float);
     size_t filter_size = filter_shape.C*filter_shape.M*filter_shape.K*filter_shape.K*sizeof(float);
@@ -212,6 +209,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
 
+
     unsigned int num_threads = ifmap_shape.C*ifmap_shape.W*ifmap_shape.W;
     unsigned int max_num_threads = 1024;
     if (num_threads > max_num_threads)
@@ -219,13 +217,16 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     else
         deconv_kernel<<<1, num_threads>>>(d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
 
-    //deconv_kernel<<<(ifmap_shape.W * ifmap_shape.W + num_threads - 1)/num_threads, num_threads>>>(N, d_playground, d_buffer);
-    // deconv_kernel<<<1, num_threads>>>(d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
-    // deconv_kernel<<<ceil(num_threads / max_num_threads), max_num_threads>>>(d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
     gpuErrchk(cudaMemcpy(ofmap, d_ofmap, ofmap_size, cudaMemcpyDeviceToHost));
     gpuErrchk(cudaFree(d_ifmap));
     gpuErrchk(cudaFree(d_filter));
     gpuErrchk(cudaFree(d_ofmap));
+    
+    end = clock();
+    printf("GPU end\n");
+    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
+    printf("Time taken for GPU is %lf\n", time_taken);
+
 }
 
 template<int BLOCK_SIZE>
@@ -302,18 +303,47 @@ void gpu_deconv_tile(float * ifmap, float * filter, float * ofmap,
 	dim3 threads(block_size, block_size);
 	dim3 grid(ifmap_shape.C, ifmap_shape.W / threads.x, ifmap_shape.W / threads.y);
 
-	deconv_kernel_tile<block_size> <<< grid, threads >>> (d_ifmap, d_filter, d_ofmap, 
-											ifmap_shape, filter_shape, ofmap_shape);
+    int nIter = 1;
+    
+    start = clock();
 
-    //deconv_kernel<<<(ifmap_shape.W * ifmap_shape.W + num_threads - 1)/num_threads, num_threads>>>(N, d_playground, d_buffer);
-    // deconv_kernel<<<1, num_threads>>>(d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
-    // deconv_kernel<<<ceil(num_threads / max_num_threads), max_num_threads>>>(d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+    for (int j=0; j<nIter; ++j) {
+        deconv_kernel_tile<block_size> <<< grid, threads >>> (d_ifmap, d_filter, d_ofmap, 
+                                                ifmap_shape, filter_shape, ofmap_shape);
+        //
+    }
+    gpuErrchk(cudaDeviceSynchronize());
+    
+    end = clock();
+    
+    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
+    
+    double flopsPerConvTranspose = 2.0 * static_cast<double>(ifmap_shape.C) *
+                                        static_cast<double>(ifmap_shape.W) *
+                                        static_cast<double>(ifmap_shape.W) *
+                                        static_cast<double>(filter_shape.M) *
+                                        static_cast<double>(filter_shape.K) *
+                                        static_cast<double>(filter_shape.K);
+
+    double gigaFlops = (flopsPerConvTranspose * 1.0e-9f) * nIter / time_taken;
+    printf(
+        "Performance= %.2f GFlop/s, Time= %.3f msec, Size= %.0f Ops," \
+        " WorkgroupSize= %u threads/block\n",
+        gigaFlops,
+        time_taken,
+        flopsPerConvTranspose,
+        threads.x * threads.y);
+
     gpuErrchk(cudaMemcpy(ofmap, d_ofmap, ofmap_size, cudaMemcpyDeviceToHost));
     gpuErrchk(cudaFree(d_ifmap));
     gpuErrchk(cudaFree(d_filter));
     gpuErrchk(cudaFree(d_ofmap));
 }
 
+void ConstantInit(float* arr, int sz, float val) {
+    for (int i=0; i<sz; ++i)
+        arr[i] = val;
+}
 
 void print_fmap(float * fmap, FmapShape fmap_shape){
     printf("%d %d %d\n", fmap_shape.C, fmap_shape.W, fmap_shape.W);
