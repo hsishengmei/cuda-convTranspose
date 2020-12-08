@@ -45,6 +45,7 @@ template<int> __global__ void deconv_kernel_tile_ifmap(float *, float *, float *
 template<int,int,int> __global__ void deconv_kernel_share_filter(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 __global__ void deconv_kernel_group_by_ofmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int,int> __global__ void deconv_kernel_group_by_ofmap_share_ifmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
+template<int,int,int> __global__ void deconv_kernel_group_by_ofmap_share_filter(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 
 /*****************************************************************/
 
@@ -390,8 +391,9 @@ void deconv_kernel_group_by_ofmap_share_ifmap(float * ifmap, float * filter, flo
     // in our case, size of this = 128 x 16 x 16 x sizeof(float) = 32768 x 4 bytes = 128KB
     // cuda1: max shared size is 0x2000 = 49152 bytes = 48KB
     // we can do this in 4 iterations
+    // ideally the speedup should be 4x of this?
 
-    __shared__ float ifmap_local[IFMAP_CHANNELS/4][IFMAP_SIZE][IFMAP_SIZE];
+    __shared__ float ifmap_shared[IFMAP_CHANNELS/4][IFMAP_SIZE][IFMAP_SIZE];
     #pragma unroll
     for (int iter=0; iter<4; ++iter) {
         // let IFMAP_CHANNELS threads load ifmap, assume that thread count is greater than channel count 
@@ -399,7 +401,7 @@ void deconv_kernel_group_by_ofmap_share_ifmap(float * ifmap, float * filter, flo
         if (threadId < IFMAP_CHANNELS/4) {
             for (int i=0; i<IFMAP_SIZE; ++i) 
                 for (int j=0; j<IFMAP_SIZE; ++j) 
-                    ifmap_local[threadId][i][j] = ifmap[get_fmap_index(threadId + iter*IFMAP_CHANNELS/4, i, j, ifmap_shape)];
+                ifmap_shared[threadId][i][j] = ifmap[get_fmap_index(threadId + iter*IFMAP_CHANNELS/4, i, j, ifmap_shape)];
         }
         __syncthreads();
 
@@ -409,7 +411,7 @@ void deconv_kernel_group_by_ofmap_share_ifmap(float * ifmap, float * filter, flo
                     int k0 = p0 - w0*2 + pad;
                     int k1 = p1 - w1*2 + pad;
                     if (k0 >= 0 && k0 < filter_shape.K && k1 >= 0 && k1 < filter_shape.K) {
-                        ofmap_local_sum += ifmap_local[c][w0][w1] \
+                        ofmap_local_sum += ifmap_shared[c][w0][w1] \
                                         * filter[get_filter_index(c+iter*IFMAP_CHANNELS/4, m, k0, k1, filter_shape)];
                     }
                 }
@@ -418,6 +420,81 @@ void deconv_kernel_group_by_ofmap_share_ifmap(float * ifmap, float * filter, flo
         ofmap[ofmap_index] = ofmap_local_sum;
     }
 }
+
+
+template<int IFMAP_CHANNELS, int OFMAP_CHANNELS, int FILTER_SIZE>
+__global__ 
+void deconv_kernel_group_by_ofmap_share_filter(float * ifmap, float * filter, float * ofmap, 
+                    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
+{
+    unsigned int m = blockIdx.x;
+    unsigned int p0 = blockIdx.y;
+    unsigned int p1 = blockIdx.z;
+
+    // total of 1024 threads
+    // unsigned int threadId = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int threadId = threadIdx.x;
+
+    // assign sz input every thread
+    // in our case, sz = 128*16*16 / 1024 = 32
+    int sz = ifmap_shape.C * ifmap_shape.W * ifmap_shape.W / 1024;
+
+    // assuming stride is always 2, batch size is always 1
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+
+    __shared__ float filter_shared[IFMAP_CHANNELS/16][OFMAP_CHANNELS][FILTER_SIZE][FILTER_SIZE];
+    // size = 128 * 64 * 4 * 4 * sizeof(float) = 512KB
+    // cuda1: max shared size is 48KB
+    // 512 / 48 = 10.xxx
+    // use 16 iterations
+    // ideally the speedup should be 16x of this?
+
+    // result sums to this
+    __shared__ float shared_sum;
+    if (threadId == 0) shared_sum = 0;
+    
+    float local_sum = 0;
+
+    #pragma unroll
+    for (int iter=0; iter<16; ++iter) {
+        // IFMAP_CHANNELS*OFMAP_CHANNELS/16 = 128*64/16 = 512, thread count = 1024
+        if (threadId < IFMAP_CHANNELS*OFMAP_CHANNELS/16) {
+            int dim0 = threadId / OFMAP_CHANNELS;
+            int dim1 = threadId % OFMAP_CHANNELS;
+            #pragma unroll
+            for (int i=0; i<FILTER_SIZE; ++i) {
+                #pragma unroll
+                for (int j=0; j<FILTER_SIZE; ++j) {
+                    filter_shared[dim0][dim1][i][j] = filter[get_filter_index(dim0, dim1, i, j, filter_shape)];
+                }
+            }
+        }
+        __syncthreads();
+        
+
+        for (int i=0; i<sz; ++i) {
+            int ifmap_index = threadId * sz + i;
+            int c = ifmap_index / (ifmap_shape.W * ifmap_shape.W);
+            int w0 = (ifmap_index % (ifmap_shape.W * ifmap_shape.W)) / ifmap_shape.W;
+            // int w1 = (ifmap_index % (ifmap_shape.W * ifmap_shape.W)) % ifmap_shape.W;
+            int w1 = ifmap_index % ifmap_shape.W;
+
+            int k0 = p0 - w0*2 + pad;
+            int k1 = p1 - w1*2 + pad;
+            if (k0 >= 0 && k0 < filter_shape.K && k1 >= 0 && k1 < filter_shape.K) {
+                local_sum += ifmap[ifmap_index] * filter_shared[c][m][k0][k1];
+            }
+        }
+        
+    }
+    
+    atomicAdd(&shared_sum, local_sum);
+
+    if (threadId == 0) ofmap[get_fmap_index(m, p0, p1, ofmap_shape)] = local_sum;
+
+}
+
 
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, 
@@ -433,7 +510,6 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     gpuErrchk(cudaMemcpy(d_ifmap, ifmap, ifmap_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
-
     
     start = clock();
 
@@ -468,6 +544,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
         }
     }
     // group by ofmap
+    //
     else if (option == 3) {
         dim3 threads(ofmap_shape.W, ofmap_shape.W);
         dim3 grid(ofmap_shape.C);
@@ -476,7 +553,9 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
-    // group by ofmap, share filter
+    // group by ofmap, share ifmap
+    // 2x perf than 3
+    // feel like too few blocks?z
     else if (option == 4) {
         dim3 threads(ofmap_shape.W, ofmap_shape.W);
         dim3 grid(ofmap_shape.C);
@@ -485,10 +564,20 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
+    // group by ofmap, share filter
+    else if (option == 5) {
+        // dim3 threads(ifmap_shape.C, ifmap_shape.W, 1024 / (ifmap_shape.C * ifmap_shape.W));  // 1024 threads, deals with the whole input
+        dim3 threads(1024);  // 1024 threads, deals with the whole input
+        dim3 grid(ofmap_shape.C, ofmap_shape.W, ofmap_shape.W); // 64*32*32 = 65536 blocks, every block counts one output from the sum of all thread's results
+        // every block shares all filters if possible 
+        for (int j=0; j<nIter; ++j) {
+            deconv_kernel_group_by_ofmap_share_filter<128,64,4> <<< grid, threads >>> 
+                (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+        }
+    }
     gpuErrchk(cudaDeviceSynchronize());
     
     end = clock();
-    
     time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
     
     double flopsPerConvTranspose = 2.0 * static_cast<double>(ifmap_shape.C) *
