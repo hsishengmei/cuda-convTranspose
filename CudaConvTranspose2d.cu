@@ -105,6 +105,7 @@ int main(int argc, char * argv[])
 
     int option = atoi(argv[1]);
     int nIter = 1000;
+    //int nIter = 1;
 
     gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
@@ -122,7 +123,7 @@ int main(int argc, char * argv[])
         printf("diff to sum ratio: %f\n", abs(diff) / sum);
     
         // print_fmap(ofmap_cpu, ofmap_shape);
-        // print_fmap(ofmap_gpu, ofmap_shape);
+        //print_fmap(ofmap_gpu, ofmap_shape);
     }
 
     free(ifmap);
@@ -254,44 +255,38 @@ __global__
 void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap, 
 						    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
 {
-	// block index
-	unsigned int c = blockIdx.x;
-	
-	// thread index
-	unsigned int m = threadIdx.x;
-	unsigned int k0 = threadIdx.y;
-	unsigned int k1 = threadIdx.z;
-
+    //unsigned int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int thread_index = threadIdx.z * blockDim.y * blockDim.x +  threadIdx.y * blockDim.x  + threadIdx.x;
+    unsigned int w0 = thread_index % (ifmap_shape.W * ifmap_shape.W) / ifmap_shape.W;
+    unsigned int w1 = thread_index % ifmap_shape.W;
     unsigned int pad = (filter_shape.K - 1) / 2;
+	
+    // thread index
+    unsigned int c = blockIdx.x;
+    unsigned int m = threadIdx.x;
+    unsigned int k0 = threadIdx.y;
+    unsigned int k1 = threadIdx.z;
 
-    // load ifmap
     __shared__ float filter_shared[M][K][K];
     filter_shared[m][k0][k1] = filter[get_filter_index(c, m, k0, k1, filter_shape)];
-
-    __shared__ float ifmap_shared[W][W];
-    // thread 0 loads it
-    if (m == 0 && k0 == 0 && k1 == 0)
-        for (int i=0; i<W; ++i) {
-            for (int j=0; j<W; ++j) {
-                ifmap_shared[i][j] = get_fmap_index(c, i, j, ifmap_shape);
-            }
-        }
     __syncthreads();
-
-    for (int w0=0; w0<ifmap_shape.W; w0++){
-        for (int w1=0; w1<ifmap_shape.W; w1++){
-            int output_y = w0*2+k0-pad;
-            int output_x = w1*2+k1-pad;
-            if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
-                // unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
-                unsigned int ofmap_index = get_fmap_index(m, output_y, output_x, ofmap_shape);
-
-                //ofmap[ofmap_index] += ifmap[ifmap_index] * filter[filter_index];
-                atomicAdd(&ofmap[ofmap_index], ifmap_shared[w0][w1] * filter_shared[m][k0][k1]);
+    m = thread_index / (ifmap_shape.W * ifmap_shape.W);
+    for (int mm=M/4*m; mm<M/4*(m+1); mm++){
+    //for (int m; m<M; m++){
+        for (int k0=0; k0<filter_shape.K; k0++){
+            for (int k1=0; k1<filter_shape.K; k1++){
+                int output_y = w0*2+k0-pad;
+                int output_x = w1*2+k1-pad;
+                if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
+                    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+                    //unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
+                    unsigned int ofmap_index = get_fmap_index(mm, output_y, output_x, ofmap_shape);
+                    //atomicAdd(&ofmap[ofmap_index], ifmap[ifmap_index] * filter[filter_index]);
+                    atomicAdd(&ofmap[ofmap_index], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
+                }
             }
-        }
+        } 
     }
-	
 }
 
 
@@ -336,6 +331,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
         // const unsigned int blockSize = ifmap_shape.W;
         dim3 threads(filter_shape.M, filter_shape.K, filter_shape.K);
         dim3 grid(filter_shape.C);
+        int nBlocks = ceil(1.0*ifmap_shape.C*ifmap_shape.W*ifmap_shape.W)/(filter_shape.M*filter_shape.K*filter_shape.K);
         for (int j=0; j<nIter; ++j) {
             deconv_kernel_share_filter<64,4,16> <<< grid, threads >>> 
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
