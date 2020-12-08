@@ -37,6 +37,7 @@ __host__ __device__ unsigned int get_filter_index(unsigned int d1, unsigned int 
     return d1 * filter_shape.M * filter_shape.K * filter_shape.K + d2 * filter_shape.K * filter_shape.K + d3 * filter_shape.K + d4;
 }
 void cpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape);
+void cpu_deconv_group_by_ofmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 void gpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape, unsigned int, unsigned int);
 void print_fmap(float *, FmapShape);
 __global__ void deconv_kernel(float *, float *, float *, FmapShape, FilterShape, FmapShape);
@@ -105,9 +106,10 @@ int main(int argc, char * argv[])
 
     int option = atoi(argv[1]);
     int nIter = 1000;
-    //int nIter = 1;
+    nIter = 1;
 
-    gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
+    // gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
+    cpu_deconv_group_by_ofmap(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape);
 
     // check correctness
     if (nIter == 1) {
@@ -169,6 +171,45 @@ void cpu_deconv(float * ifmap, float * filter, float * ofmap,
     time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
     printf("Time taken for CPU is %lf\n", time_taken);
 }
+
+
+void cpu_deconv_group_by_ofmap(float * ifmap, float * filter, float * ofmap, 
+    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
+{
+    printf("CPU reorder start\n");
+    start = clock();
+
+    // assuming stride is always 2, batch size is always 1
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+    for (int m=0; m<ofmap_shape.C; m++) {
+        for (int p0=0; p0<ofmap_shape.W; p0++) {
+            for (int p1=0; p1<ofmap_shape.W; p1++) {
+                int ofmap_index = get_fmap_index(m, p0, p1, ofmap_shape);
+                for (int c=0; c<ifmap_shape.C; c++) {
+                    for (int w0=0; w0<ifmap_shape.W; w0++) {
+                        for (int w1=0; w1<ifmap_shape.W; w1++) {
+                            int k0 = p0 - w0*2 + pad;
+                            int k1 = p1 - w1*2 + pad;
+                            if (k0 >= 0 && k0 < filter_shape.K && k1 >= 0 && k1 < filter_shape.K) {
+                                // ofmap[m][p0][p1] += ifmap[c][w0][w1] * filter[c][m][k0][k1];
+                                ofmap[ofmap_index] += ifmap[get_fmap_index(c, w0, w1, ifmap_shape)] \
+                                                        * filter[get_filter_index(c, m, k0, k1, filter_shape)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+
+    end = clock();
+    printf("CPU reorder end\n");
+    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
+    printf("Time taken for CPU reorder is %lf\n", time_taken);
+}
+
 
 __global__ 
 void deconv_kernel(float * ifmap, float * filter, float * ofmap, 
@@ -289,7 +330,6 @@ void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap,
     }
 }
 
-
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, 
                 unsigned int nIter, unsigned int option)
@@ -338,7 +378,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
 
         }
     }
-    // tile ofmap
+    // group by ofmap
     else if (option == 3) {
         
     }
