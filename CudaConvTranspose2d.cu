@@ -42,6 +42,7 @@ void print_fmap(float *, FmapShape);
 __global__ void deconv_kernel(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int> __global__ void deconv_kernel_tile_ifmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int,int,int> __global__ void deconv_kernel_share_filter(float *, float *, float *, FmapShape, FilterShape, FmapShape);
+template<int,int,int> __global__ void deconv_kernel_share_filter_tiled(float *, float *, float *, FmapShape, FilterShape, FmapShape, int);
 
 /*****************************************************************/
 
@@ -250,6 +251,65 @@ void deconv_kernel_tile_ifmap(float * ifmap, float * filter, float * ofmap,
 }
 
 // share filter & input
+template<int Tm, int K, int W>
+__global__ 
+void deconv_kernel_share_filter_tiled(float * ifmap, float * filter, float * ofmap, 
+						    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, int Tmm)
+{
+    unsigned int thread_index = threadIdx.x;
+    //unsigned int thread_index = threadIdx.z * blockDim.y * blockDim.x +  threadIdx.y * blockDim.x  + threadIdx.x;
+    unsigned int w0 = thread_index % (ifmap_shape.W * ifmap_shape.W) / ifmap_shape.W;
+    unsigned int w1 = thread_index % ifmap_shape.W;
+
+    // process one input channel per block	
+    unsigned int c = blockIdx.x;
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+    //assuming num of threads is a multiple of W*W
+
+    __shared__ float filter_shared[Tm][K][K];
+    for (int i = thread_index; i < Tm*K*K; i += blockDim.x) {
+        unsigned int ifmap_m = i / (filter_shape.K * filter_shape.K);
+        unsigned int ifmap_k0 = i % (filter_shape.K * filter_shape.K) / filter_shape.K;
+        unsigned int ifmap_k1 = i % filter_shape.K;
+        filter_shared[ifmap_m][ifmap_k0][ifmap_k1] = filter[get_filter_index(c, Tmm*8+ifmap_m, ifmap_k0, ifmap_k1, filter_shape)];
+    }
+
+    __shared__ float ofmap_shared[Tm][2*W][2*W];
+    for (int i = thread_index; i < Tm*2*W*2*W; i += blockDim.x) {
+        unsigned int ofmap_m = i / (ofmap_shape.W * ofmap_shape.W);
+        unsigned int ofmap_w0 = i % (ofmap_shape.W * ofmap_shape.W) / ofmap_shape.W;
+        unsigned int ofmap_w1 = i % ofmap_shape.W;
+        ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1] = 0;
+    }
+
+    __syncthreads();
+    unsigned int m = thread_index / (ifmap_shape.W * ifmap_shape.W);
+    for (int mm=Tm/4*m; mm<Tm/4*(m+1); mm++){
+        for (int k0=0; k0<filter_shape.K; k0++){
+            for (int k1=0; k1<filter_shape.K; k1++){
+                int output_y = w0*2+k0-pad;
+                int output_x = w1*2+k1-pad;
+                if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
+                    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+                    unsigned int ofmap_index = get_fmap_index(mm, output_y, output_x, ofmap_shape);
+                    //atomicAdd(&ofmap[ofmap_index], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
+                    atomicAdd(&ofmap_shared[mm][output_y][output_x], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
+                }
+            }
+        } 
+    }
+
+    __syncthreads();
+    for (int i = thread_index; i < Tm*2*W*2*W; i += blockDim.x) {
+        unsigned int ofmap_m = i / (ofmap_shape.W * ofmap_shape.W);
+        unsigned int ofmap_w0 = i % (ofmap_shape.W * ofmap_shape.W) / ofmap_shape.W;
+        unsigned int ofmap_w1 = i % ofmap_shape.W;
+        atomicAdd(&ofmap[get_fmap_index(Tmm*8+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)], ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1]);
+        //ofmap[get_fmap_index(Tmm*8+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)] += ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1];
+    }
+}
+
 template<int M, int K, int W>
 __global__ 
 void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap, 
@@ -289,7 +349,6 @@ void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap,
     }
 }
 
-
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, 
                 unsigned int nIter, unsigned int option)
@@ -316,7 +375,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
-    // tile ifmap
+    // shared ifmap
     else if (option == 1) {
         const unsigned int blockSize = 16;
         dim3 threads(blockSize, blockSize);
@@ -326,20 +385,27 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
-    // tile filter
+    // shared filter 
     else if (option == 2) {
-        // const unsigned int blockSize = ifmap_shape.W;
         dim3 threads(filter_shape.M, filter_shape.K, filter_shape.K);
         dim3 grid(filter_shape.C);
-        int nBlocks = ceil(1.0*ifmap_shape.C*ifmap_shape.W*ifmap_shape.W)/(filter_shape.M*filter_shape.K*filter_shape.K);
         for (int j=0; j<nIter; ++j) {
             deconv_kernel_share_filter<64,4,16> <<< grid, threads >>> 
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
 
         }
     }
-    // tile ofmap
+    // shared filter/ofmap + tiling
     else if (option == 3) {
+        unsigned int threads = 1024;
+        dim3 grid(filter_shape.C);
+        for (int j=0; j<nIter; ++j) {
+            for (int k=0; k<8; ++k) {
+                deconv_kernel_share_filter_tiled<8, 4,16> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k);
+            }
+
+        }
         
     }
     gpuErrchk(cudaDeviceSynchronize());
