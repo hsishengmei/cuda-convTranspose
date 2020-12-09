@@ -1,9 +1,15 @@
 #include <torch/torch.h>
 #include <iostream>
-#include <ctime>
+#include <chrono>
 
 int main(int argc, char** argv) {
-    int C = 128, W = 16, M = 64, K = 4;
+    int C, W, M, K;
+    K = 4;
+
+    W = atoi(argv[1]);
+    C = atoi(argv[2]);
+    M = atoi(argv[3]);
+    
     auto tensorOptions = torch::TensorOptions()
                                 .dtype(torch::kFloat32)
                                 .layout(torch::kStrided)
@@ -23,25 +29,25 @@ int main(int argc, char** argv) {
                                                 .output_padding(output_pad)
                                                 .bias(false));  
 
-    printf("start\n");
-    std::time_t start = std::time(nullptr);
+    auto start = std::chrono::high_resolution_clock::now();
 
     for (int i=0; i<nIter; ++i) {
         ofmap = deconv(ifmap);
     }
     
 
-    double time_taken = std::difftime(std::time(nullptr), start);
-    printf("Time taken for GPU is %lf seconds\n", time_taken);
+    auto end = std::chrono::high_resolution_clock::now();    
+    std::chrono::duration<double, std::milli> duration = end - start;
+    auto ms_taken = duration.count();
         
     double flopsPerConvTranspose = 2.0*C*W*W*M*K*K;
 
-    double gigaFlops = (flopsPerConvTranspose * 1.0e-9f) * nIter / time_taken;
+    double gigaFlops = 1.0 * (flopsPerConvTranspose * 1.0e-9f) * nIter / ms_taken * 1000;
     printf(
         "Performance=%.2f GFlop/s, Iterations=%d, Total Time=%.3f seconds, Ops per Iteration=%.0f\n",
         gigaFlops,
         nIter,
-        time_taken,
+        ms_taken/1000,
         flopsPerConvTranspose);
 
 }

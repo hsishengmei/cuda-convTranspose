@@ -2,11 +2,14 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 import time
+import sys 
 
-C = 128
-W = 16
-M = 64
 K = 4
+
+W = int(sys.argv[1])
+C = int(sys.argv[2])
+M = int(sys.argv[3])
+    
 
 if torch.cuda.is_available():
     print("current cuda device:", torch.cuda.current_device())
