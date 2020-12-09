@@ -105,8 +105,8 @@ int main(int argc, char * argv[])
     //     ofmap_gpu[i] = 0.0;
 
     int option = atoi(argv[1]);
-    int nIter = 1000;
-    //int nIter = 1;
+    //int nIter = 1000;
+    int nIter = 1;
 
     gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
@@ -285,28 +285,34 @@ void deconv_kernel_share_filter_tiled(float * ifmap, float * filter, float * ofm
 
     __syncthreads();
     unsigned int m = thread_index / (ifmap_shape.W * ifmap_shape.W);
-    for (int mm=Tm/4*m; mm<Tm/4*(m+1); mm++){
-        for (int k0=0; k0<filter_shape.K; k0++){
-            for (int k1=0; k1<filter_shape.K; k1++){
-                int output_y = w0*2+k0-pad;
-                int output_x = w1*2+k1-pad;
-                if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
-                    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
-                    unsigned int ofmap_index = get_fmap_index(mm, output_y, output_x, ofmap_shape);
-                    //atomicAdd(&ofmap[ofmap_index], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
-                    atomicAdd(&ofmap_shared[mm][output_y][output_x], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
-                }
+    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+    // divide output per filter into 4 block to avoid conflict
+    for (int b0=0; b0<2; b0++){
+        for (int b1=0; b1<2; b1++){
+            for (int mm=Tm/4*m; mm<Tm/4*(m+1); mm++){
+                for (int k0=b0*2; k0<(b0+1)*2; k0++){
+                    for (int k1=b1*2; k1<(b1+1)*2; k1++){
+                        int output_y = w0*2+k0-pad;
+                        int output_x = w1*2+k1-pad;
+                        if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
+                            unsigned int ofmap_index = get_fmap_index(mm, output_y, output_x, ofmap_shape);
+                            //atomicAdd(&ofmap_shared[mm][output_y][output_x], ifmap[ifmap_index] * filter_shared[mm][k0][k1]);
+                            ofmap_shared[mm][output_y][output_x] += ifmap[ifmap_index] * filter_shared[mm][k0][k1];
+                        }
+                    }
+                } 
             }
-        } 
+            __syncthreads();
+        }
     }
 
     __syncthreads();
+
     for (int i = thread_index; i < Tm*2*W*2*W; i += blockDim.x) {
         unsigned int ofmap_m = i / (ofmap_shape.W * ofmap_shape.W);
         unsigned int ofmap_w0 = i % (ofmap_shape.W * ofmap_shape.W) / ofmap_shape.W;
         unsigned int ofmap_w1 = i % ofmap_shape.W;
         atomicAdd(&ofmap[get_fmap_index(Tmm*8+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)], ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1]);
-        //ofmap[get_fmap_index(Tmm*8+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)] += ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1];
     }
 }
 
@@ -357,9 +363,16 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     size_t ifmap_size = ifmap_shape.C*ifmap_shape.W*ifmap_shape.W*sizeof(float);
     size_t filter_size = filter_shape.C*filter_shape.M*filter_shape.K*filter_shape.K*sizeof(float);
     size_t ofmap_size = ofmap_shape.C*ofmap_shape.W*ofmap_shape.W*sizeof(float);
-    gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
-    gpuErrchk(cudaMalloc(&d_filter, filter_size));
-    gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
+    int pinned = 0;
+    if (pinned == 0){
+        gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
+        gpuErrchk(cudaMalloc(&d_filter, filter_size));
+        gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
+    } else {
+        gpuErrchk(cudaMallocHost(&d_ifmap, ifmap_size));
+        gpuErrchk(cudaMallocHost(&d_filter, filter_size));
+        gpuErrchk(cudaMallocHost(&d_ofmap, ofmap_size));
+    }
     gpuErrchk(cudaMemcpy(d_ifmap, ifmap, ifmap_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
@@ -430,9 +443,15 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
         flopsPerConvTranspose);
 
     gpuErrchk(cudaMemcpy(ofmap, d_ofmap, ofmap_size, cudaMemcpyDeviceToHost));
-    gpuErrchk(cudaFree(d_ifmap));
-    gpuErrchk(cudaFree(d_filter));
-    gpuErrchk(cudaFree(d_ofmap));
+    if (pinned == 0){
+    	gpuErrchk(cudaFree(d_ifmap));
+    	gpuErrchk(cudaFree(d_filter));
+    	gpuErrchk(cudaFree(d_ofmap));
+    } else {
+    	gpuErrchk(cudaFreeHost(d_ifmap));
+    	gpuErrchk(cudaFreeHost(d_filter));
+    	gpuErrchk(cudaFreeHost(d_ofmap));
+    }
 }
 
 void ConstantInit(float* arr, int sz, float val) {
