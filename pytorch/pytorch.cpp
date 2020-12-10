@@ -6,9 +6,32 @@ int main(int argc, char** argv) {
     int C, W, M, K;
     K = 4;
 
-    W = atoi(argv[1]);
-    C = atoi(argv[2]);
-    M = atoi(argv[3]);
+    int layer = atoi(argv[1]);
+    if (layer == 0) {
+        C = 512;
+        M = 256;
+        W = 4;
+    }
+    else if (layer == 1) {
+        C = 256;
+        M = 128;
+        W = 8;
+    }
+    else if (layer == 2) {
+        C = 128;
+        M = 64;
+        W = 16;
+    }
+    else if (layer == 3) {
+        C = 64;
+        M = 3;
+        W = 32;
+    }
+    else {
+        printf("layer not found\n");
+        exit(1);
+    }
+    printf("layer %d: C=%d M=%d W=%d K=%d\n", layer, C, M, W, K);
     
     auto tensorOptions = torch::TensorOptions()
                                 .dtype(torch::kFloat32)

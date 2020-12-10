@@ -6,13 +6,29 @@ import sys
 
 K = 4
 
-W = int(sys.argv[1])
-C = int(sys.argv[2])
-M = int(sys.argv[3])
-    
+layer = int(sys.argv[1])
+
+if layer == 0:
+    W = 4
+    C = 512
+    M = 256
+elif layer == 1:
+    W = 8
+    C = 256
+    M = 128
+elif layer == 2:
+    W = 16
+    C = 128
+    M = 64
+elif layer == 3:
+    W = 32
+    C = 64
+    M = 3
+
+print("layer %d: W=%d C=%d M=%d K=%d" % (layer, W, C, M, K))
 
 if torch.cuda.is_available():
-    print("current cuda device:", torch.cuda.current_device())
+    print("cuda is available")
 
 input = torch.randn(1, C, W, W, dtype=torch.float32, layout=torch.strided, requires_grad=False)
 weight = torch.randn(C, M, K, K, dtype=torch.float32, layout=torch.strided, requires_grad=False)
