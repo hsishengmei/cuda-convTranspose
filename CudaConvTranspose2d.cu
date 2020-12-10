@@ -109,9 +109,9 @@ int main(int argc, char * argv[])
     ofmap_cpu = (float *)calloc(4*M*W*W, sizeof(float));
     ofmap_gpu = (float *)calloc(4*M*W*W, sizeof(float));
 
-    printf("ifmap size: %d\n", C*W*W);
-    printf("filter size: %d\n", C*M*K*K);
-    printf("ofmap size: %d\n", 4*M*W*W);
+    printf("ifmap size=%d, ", C*W*W);
+    printf("filter size=%d, ", C*M*K*K);
+    printf("ofmap size=%d\n", 4*M*W*W);
     // return 0;
     /* Initialize it: calloc already initalized everything to 0 */
     
@@ -134,21 +134,21 @@ int main(int argc, char * argv[])
         gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
     // check correctness
-    if (nIter == 1) {
-        cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
+    // if (nIter == 1) {
+    //     cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
         
-        double diff = 0, sum = 0;
-        for (int i=0; i<4*M*W*W; i++) {
-            sum += ofmap_cpu[i];
-            diff += (ofmap_gpu[i] - ofmap_cpu[i]);
-        }
-        printf("sum: %f\n", sum);
-        printf("diff: %f\n", abs(diff));
-        printf("diff to sum ratio: %f\n", abs(diff) / sum);
+    //     double diff = 0, sum = 0;
+    //     for (int i=0; i<4*M*W*W; i++) {
+    //         sum += ofmap_cpu[i];
+    //         diff += (ofmap_gpu[i] - ofmap_cpu[i]);
+    //     }
+    //     printf("sum: %f\n", sum);
+    //     printf("diff: %f\n", abs(diff));
+    //     printf("diff to sum ratio: %f\n", abs(diff) / sum);
     
-        // print_fmap(ofmap_cpu, ofmap_shape);
-        // print_fmap(ofmap_gpu, ofmap_shape);
-    }
+    //     // print_fmap(ofmap_cpu, ofmap_shape);
+    //     // print_fmap(ofmap_gpu, ofmap_shape);
+    // }
 
     free(ifmap);
     free(filter);
@@ -518,7 +518,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
 
 void calc_flops(double seconds, unsigned int opsPerConvTranspose, unsigned int nIter) {
     double gigaFlops = 1.0 * (opsPerConvTranspose * 1.0e-9f) * nIter / seconds;
-    printf("Iterations=%d, Total Time=%.2f seconds, Ops per Iteration=%d\n", nIter, seconds, opsPerConvTranspose);
+    printf("Iterations=%d, Total Time=%.2f seconds, Ops per Iteration=%d\n\n", nIter, seconds, opsPerConvTranspose);
     printf("Performance=%.3f GFlops/sec\n", gigaFlops);
     printf("Average time per iteration=%.2f msec\n\n", seconds * 1000 / nIter);
 }
