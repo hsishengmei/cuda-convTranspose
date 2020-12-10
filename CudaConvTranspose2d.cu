@@ -52,21 +52,41 @@ clock_t start, end;
 
 int main(int argc, char * argv[])
 {
+    // layer parameters
     unsigned int W, C, M, K;
-    W = 16; // input size: W*W
-    C = 128; // input channel
-    M = 64; // output channel
-    K = 4;    // kernel size: K*K
+    K = 4;    // kernel size fixed: 4x4
 
-    // W = 16;
-    // C = 4;
-    // M = 4;
-    // K = 4;
-	
-    // W = 4;
-    // C = 1;
-    // M = 1;
-    // K = 4;
+    // decides which algorithm to use
+    int option = atoi(argv[1]);
+
+    // decides layer parameters
+    int layer = atoi(argv[2]);
+    if (layer == 0) {
+        C = 512;
+        M = 256;
+        W = 4;
+    }
+    else if (layer == 1) {
+        C = 256;
+        M = 128;
+        W = 8;
+    }
+    else if (layer == 2) {
+        C = 128;
+        M = 64;
+        W = 16;
+    }
+    else if (layer == 3) {
+        C = 64;
+        M = 3;
+        W = 32;
+    }
+    else {
+        printf("layer not found\n");
+        exit(1);
+    }
+    printf("layer %d: C=%d M=%d W=%d K=%d\n", layer, C, M, W, K);
+
 
     FmapShape ifmap_shape;
     ifmap_shape.C = C;
@@ -103,9 +123,8 @@ int main(int argc, char * argv[])
     // for(int i = 0; i < 4*M*W*W; i++)
     //     ofmap_gpu[i] = 0.0;
 
-    int option = atoi(argv[1]);
-    //int nIter = 1000;
-    int nIter = 1;
+    int nIter = 1000;
+    // int nIter = 1;
 
     gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
@@ -407,15 +426,69 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     else if (option == 3) {
         unsigned int threads = 1024;
         dim3 grid(filter_shape.C);
-        const unsigned int Tm = 10;
-        const unsigned int remaining_Tm = 4; // manually compute the remaining dimenstion
         for (int j=0; j<nIter; ++j) {
-            for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
-                deconv_kernel_share_filter_tiled<Tm, 4, 16> <<< grid, threads >>> 
-                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+            if (filter_shape.M == 256) {
+                // M = 256, W = 4, Tm = 150, remaining Tm = 106
+                const unsigned int W = 4;
+                const unsigned int Tm = 150;
+                const unsigned int remaining_Tm = 106; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
             }
-            deconv_kernel_share_filter_tiled<remaining_Tm, 4, 16> <<< grid, threads >>> 
-                (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+            else if (filter_shape.M == 128) {
+                // M = 128, W = 8, Tm = 45, remaining Tm = 38
+                const unsigned int W = 8;
+                const unsigned int Tm = 45;
+                const unsigned int remaining_Tm = 38; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else if (filter_shape.M == 64) {
+                // M = 64, W = 16, Tm = 10, remaining Tm = 4
+                const unsigned int W = 16;
+                const unsigned int Tm = 10;
+                const unsigned int remaining_Tm = 4; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else if (filter_shape.M == 3) {
+                // M = 3, W = 32, Tm = 2, remaining Tm = 1
+                const unsigned int W = 32;
+                const unsigned int Tm = 2;
+                const unsigned int remaining_Tm = 1; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else {
+                printf("layer not found\n");
+                exit(1);
+            }
+            // for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+            //     deconv_kernel_share_filter_tiled<Tm, 4, 16> <<< grid, threads >>> 
+            //         (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+            // }
+            // deconv_kernel_share_filter_tiled<remaining_Tm, 4, 16> <<< grid, threads >>> 
+            //     (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
 
         }
         
