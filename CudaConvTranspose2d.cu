@@ -37,11 +37,13 @@ __host__ __device__ unsigned int get_filter_index(unsigned int d1, unsigned int 
     return d1 * filter_shape.M * filter_shape.K * filter_shape.K + d2 * filter_shape.K * filter_shape.K + d3 * filter_shape.K + d4;
 }
 void cpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape);
+void cpu_deconv_group_by_ofmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 void gpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape, unsigned int, unsigned int);
 void calc_flops(double, unsigned int, unsigned int);
 void print_fmap(float *, FmapShape);
 __global__ void deconv_kernel(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int,int,int> __global__ void deconv_kernel_share_filter_tiled(float *, float *, float *, FmapShape, FilterShape, FmapShape, int);
+template<int> __global__ void deconv_kernel_group_by_ofmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 
 /*****************************************************************/
 
@@ -123,9 +125,11 @@ int main(int argc, char * argv[])
     //     ofmap_gpu[i] = 0.0;
 
     int nIter = 1000;
-    // int nIter = 1;
+    // nIter = 1;
     if (option == 0)
         cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
+    else if (option == 3)
+        cpu_deconv_group_by_ofmap(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
     else
         gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
@@ -193,6 +197,49 @@ void cpu_deconv(float * ifmap, float * filter, float * ofmap,
 
     calc_flops(seconds, opsPerConvTranspose, nIter);
 }
+
+void cpu_deconv_group_by_ofmap(float * ifmap, float * filter, float * ofmap, 
+                FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
+{
+    start = clock();
+
+    // assuming stride is always 2, batch size is always 1
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+    int nIter = 10;
+    for (int i=0; i<nIter; ++i) {
+        for (int m=0; m<ofmap_shape.C; m++) {
+            for (int p0=0; p0<ofmap_shape.W; p0++) {
+                for (int p1=0; p1<ofmap_shape.W; p1++) {
+                    float ofmap_local = 0;
+                    for (int c=0; c<ifmap_shape.C; c++) {
+                        for (int w0=0; w0<ifmap_shape.W; w0++) {
+                            for (int w1=0; w1<ifmap_shape.W; w1++) {
+                                int k0 = p0 - w0*2 + pad;
+                                int k1 = p1 - w1*2 + pad;
+                                if (k0 >= 0 && k0 < filter_shape.K && k1 >= 0 && k1 < filter_shape.K) {
+                                    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+                                    unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
+                                    ofmap_local += ifmap[ifmap_index] * filter[filter_index];
+                                }
+                            }
+                        }
+                    }
+                    int ofmap_index = get_fmap_index(m, p0, p1, ofmap_shape);
+                    ofmap[ofmap_index] = ofmap_local;
+                }
+            }
+        }
+    }
+    
+    end = clock();
+    seconds = ((double)(end - start))/ CLOCKS_PER_SEC;
+    unsigned int opsPerConvTranspose = 2 * ifmap_shape.C *ifmap_shape.W * ifmap_shape.W *
+                                            filter_shape.M * filter_shape.K * filter_shape.K;
+
+    calc_flops(seconds, opsPerConvTranspose, nIter);
+}
+
 
 __global__ 
 void deconv_kernel(float * ifmap, float * filter, float * ofmap, 
@@ -282,6 +329,49 @@ void deconv_kernel_share_filter_tiled(float * ifmap, float * filter, float * ofm
         unsigned int ofmap_w1 = i % ofmap_shape.W;
         atomicAdd(&ofmap[get_fmap_index(m_offset+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)], ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1]);
     }
+}
+
+template<int IFMAP_SIZE>
+__global__ 
+void deconv_kernel_group_by_ofmap(float * ifmap, float * filter, float * ofmap, 
+                    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
+{
+    unsigned int m = blockIdx.x;
+
+    unsigned int p0 = threadIdx.x;
+    unsigned int p1 = threadIdx.y;
+
+
+
+    // assuming stride is always 2, batch size is always 1
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+    __shared__ float ifmap_shared[IFMAP_SIZE][IFMAP_SIZE];
+    float ofmap_local = 0;
+    for (int c=0; c<ifmap_shape.C; c++) {
+        if (p0 == 0 && p1 == 0) {
+            #pragma unroll
+            for (int i=0; i<IFMAP_SIZE; ++i) {
+                #pragma unroll
+                for (int j=0; j<IFMAP_SIZE; ++j) {
+                    ifmap_shared[i][j] = ifmap[get_fmap_index(c, i, j, ifmap_shape)];
+                }
+            }
+        }
+        __syncthreads();
+        for (int w0=0; w0<ifmap_shape.W; w0++) {
+            for (int w1=0; w1<ifmap_shape.W; w1++) {
+                int k0 = p0 - w0*2 + pad;
+                int k1 = p1 - w1*2 + pad;
+                if (k0 >= 0 && k0 < filter_shape.K && k1 >= 0 && k1 < filter_shape.K) {
+                    ofmap_local += ifmap_shared[w0][w1] * filter[get_filter_index(c, m, k0, k1, filter_shape)];
+                }
+            }
+        }
+    }
+    int ofmap_index = get_fmap_index(m, p0, p1, ofmap_shape);
+    ofmap[ofmap_index] = ofmap_local;
+
 }
 
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
@@ -381,8 +471,37 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
             //     (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
 
         }
-        
     }
+    // group by ofmap
+    else if (option == 4) {
+        dim3 threads(ofmap_shape.W, ofmap_shape.W);
+        dim3 grid(ofmap_shape.C);
+        for (int j=0; j<nIter; ++j) {
+            if (ofmap_shape.W == 8) {
+                deconv_kernel_group_by_ofmap<8> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+            }
+            else if (ofmap_shape.W == 16) {
+                deconv_kernel_group_by_ofmap<16> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+            }
+            else if (ofmap_shape.W == 32) {
+                deconv_kernel_group_by_ofmap<32> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+            }
+            else if (ofmap_shape.W == 64) {
+                printf("bug exists, still working on it\n");
+                exit(1);
+                deconv_kernel_group_by_ofmap<64> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
+            }
+            else {
+                printf("layer not found\n");
+                exit(1);
+            }
+        }
+    }
+
     gpuErrchk(cudaDeviceSynchronize());
     
     end = clock();
@@ -404,7 +523,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
 void calc_flops(double seconds, unsigned int opsPerConvTranspose, unsigned int nIter) {
     double gigaFlops = 1.0 * (opsPerConvTranspose * 1.0e-9f) * nIter / seconds;
     printf("Iterations=%d, Total Time=%.2f seconds, Ops per Iteration=%d\n", nIter, seconds, opsPerConvTranspose);
-    printf("Performance=%.2f GFlop/sec\n", gigaFlops);
+    printf("Performance=%.3f GFlop/sec\n", gigaFlops);
     printf("Average time per iteration=%.2f msec\n\n", seconds * 1000 / nIter);
 }
 
