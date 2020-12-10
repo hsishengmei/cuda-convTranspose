@@ -128,7 +128,7 @@ int main(int argc, char * argv[])
     // nIter = 1;
     if (option == 0)
         cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
-    else if (option == 3)
+    else if (option == 1)
         cpu_deconv_group_by_ofmap(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
     else
         gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
@@ -337,11 +337,8 @@ void deconv_kernel_group_by_ofmap(float * ifmap, float * filter, float * ofmap,
                     FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
 {
     unsigned int m = blockIdx.x;
-
     unsigned int p0 = threadIdx.x;
     unsigned int p1 = threadIdx.y;
-
-
 
     // assuming stride is always 2, batch size is always 1
     unsigned int pad = (filter_shape.K - 1) / 2;
@@ -390,12 +387,11 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     gpuErrchk(cudaMemcpy(d_ifmap, ifmap, ifmap_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
-
     
     start = clock();
 
     // naive impl
-    if (option == 1) {
+    if (option == 2) {
         int nBlocks = ceil(1.0*ifmap_shape.C*ifmap_shape.W*ifmap_shape.W)/1024;
         for (int j=0; j<nIter; ++j) {
             deconv_kernel <<< nBlocks, 1024 >>> 
@@ -403,7 +399,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
         }
     }
     // shared filter/ofmap + tiling
-    else if (option == 2) {
+    else if (option == 3) {
         unsigned int threads = 1024;
         dim3 grid(filter_shape.C);
         for (int j=0; j<nIter; ++j) {
@@ -461,15 +457,11 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
             }
             else {
                 printf("layer not found\n");
+                gpuErrchk(cudaFree(d_ifmap));
+                gpuErrchk(cudaFree(d_filter));
+                gpuErrchk(cudaFree(d_ofmap));
                 exit(1);
             }
-            // for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
-            //     deconv_kernel_share_filter_tiled<Tm, 4, 16> <<< grid, threads >>> 
-            //         (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
-            // }
-            // deconv_kernel_share_filter_tiled<remaining_Tm, 4, 16> <<< grid, threads >>> 
-            //     (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
-
         }
     }
     // group by ofmap
@@ -490,13 +482,17 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                     (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
             }
             else if (ofmap_shape.W == 64) {
-                printf("bug exists, still working on it\n");
+                printf("layer not supported: ofmap shape too large\n");
+                gpuErrchk(cudaFree(d_ifmap));
+                gpuErrchk(cudaFree(d_filter));
+                gpuErrchk(cudaFree(d_ofmap));
                 exit(1);
-                deconv_kernel_group_by_ofmap<64> <<< grid, threads >>> 
-                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
             }
             else {
                 printf("layer not found\n");
+                gpuErrchk(cudaFree(d_ifmap));
+                gpuErrchk(cudaFree(d_filter));
+                gpuErrchk(cudaFree(d_ofmap));
                 exit(1);
             }
         }
@@ -523,7 +519,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
 void calc_flops(double seconds, unsigned int opsPerConvTranspose, unsigned int nIter) {
     double gigaFlops = 1.0 * (opsPerConvTranspose * 1.0e-9f) * nIter / seconds;
     printf("Iterations=%d, Total Time=%.2f seconds, Ops per Iteration=%d\n", nIter, seconds, opsPerConvTranspose);
-    printf("Performance=%.3f GFlop/sec\n", gigaFlops);
+    printf("Performance=%.3f GFlops/sec\n", gigaFlops);
     printf("Average time per iteration=%.2f msec\n\n", seconds * 1000 / nIter);
 }
 

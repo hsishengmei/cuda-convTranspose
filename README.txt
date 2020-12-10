@@ -9,9 +9,9 @@ nvcc -o cudaConvTranspose CudaConvTranspose2d.cu
 
 algo: 0, 1, 2, 3, 4
 - algo 0: cpu naive implementation
-- algo 1: gpu naive implementation
-- algo 2: gpu share filter & ofmap, tiled (best)
-- algo 3: cpu group by ofmap
+- algo 1: cpu group by ofmap
+- algo 2: gpu naive implementation
+- algo 3: gpu share filter & ofmap, tiled (best)
 - algo 4: gpu group by ofmap, share ifmap
 
 layer: 0, 1, 2, 3
