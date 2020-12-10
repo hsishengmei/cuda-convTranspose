@@ -42,6 +42,7 @@ void print_fmap(float *, FmapShape);
 __global__ void deconv_kernel(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int> __global__ void deconv_kernel_tile_ifmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int,int,int> __global__ void deconv_kernel_share_filter(float *, float *, float *, FmapShape, FilterShape, FmapShape);
+template<int,int,int> __global__ void deconv_kernel_share_filter_tiled(float *, float *, float *, FmapShape, FilterShape, FmapShape, int);
 
 /*****************************************************************/
 
@@ -51,22 +52,41 @@ clock_t start, end;
 
 int main(int argc, char * argv[])
 {
+    // layer parameters
     unsigned int W, C, M, K;
-    // int type_of_device = 0; // CPU or GPU
-    W = 16; // input size: W*W
-    C = 128; // input channel
-    M = 64; // output channel
-    K = 4;    // kernel size: K*K
+    K = 4;    // kernel size fixed: 4x4
 
-    // W = 16;
-    // C = 4;
-    // M = 4;
-	// K = 4;
-	
-    // W = 4;
-    // C = 1;
-    // M = 1;
-    // K = 4;
+    // decides which algorithm to use
+    int option = atoi(argv[1]);
+
+    // decides layer parameters
+    int layer = atoi(argv[2]);
+    if (layer == 0) {
+        C = 512;
+        M = 256;
+        W = 4;
+    }
+    else if (layer == 1) {
+        C = 256;
+        M = 128;
+        W = 8;
+    }
+    else if (layer == 2) {
+        C = 128;
+        M = 64;
+        W = 16;
+    }
+    else if (layer == 3) {
+        C = 64;
+        M = 3;
+        W = 32;
+    }
+    else {
+        printf("layer not found\n");
+        exit(1);
+    }
+    printf("layer %d: C=%d M=%d W=%d K=%d\n", layer, C, M, W, K);
+
 
     FmapShape ifmap_shape;
     ifmap_shape.C = C;
@@ -103,9 +123,8 @@ int main(int argc, char * argv[])
     // for(int i = 0; i < 4*M*W*W; i++)
     //     ofmap_gpu[i] = 0.0;
 
-    int option = atoi(argv[1]);
     int nIter = 1000;
-    //int nIter = 1;
+    // int nIter = 1;
 
     gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
@@ -250,6 +269,67 @@ void deconv_kernel_tile_ifmap(float * ifmap, float * filter, float * ofmap,
 }
 
 // share filter & input
+template<int Tm, int K, int W>
+__global__ 
+void deconv_kernel_share_filter_tiled(float * ifmap, float * filter, float * ofmap, 
+						    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, int m_offset)
+{
+    unsigned int w0 = threadIdx.x % (ifmap_shape.W * ifmap_shape.W) / ifmap_shape.W;
+    unsigned int w1 = threadIdx.x % ifmap_shape.W;
+    unsigned int pad = (filter_shape.K - 1) / 2;
+
+    // process one input channel per block	
+    unsigned int c = blockIdx.x;
+    // assume num of threads is a multiple of W*W, each thread should be responsible for multiple m's
+    unsigned int m_parallel = blockDim.x / (ifmap_shape.W * ifmap_shape.W);
+    unsigned int m_per_thread = (Tm + m_parallel - 1)/ m_parallel;
+
+    __shared__ float filter_shared[Tm][K][K];
+    for (int i = threadIdx.x; i < Tm*K*K; i += blockDim.x) {
+        unsigned int filter_m = i / (filter_shape.K * filter_shape.K);
+        unsigned int filter_k0 = i % (filter_shape.K * filter_shape.K) / filter_shape.K;
+        unsigned int filter_k1 = i % filter_shape.K;
+        filter_shared[filter_m][filter_k0][filter_k1] = filter[get_filter_index(c, m_offset+filter_m, filter_k0, filter_k1, filter_shape)];
+    }
+
+    __shared__ float ofmap_shared[Tm][2*W][2*W];
+    for (int i = threadIdx.x; i < Tm*2*W*2*W; i += blockDim.x) {
+        unsigned int ofmap_m = i / (ofmap_shape.W * ofmap_shape.W);
+        unsigned int ofmap_w0 = i % (ofmap_shape.W * ofmap_shape.W) / ofmap_shape.W;
+        unsigned int ofmap_w1 = i % ofmap_shape.W;
+        ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1] = 0;
+    }
+
+    __syncthreads();
+    unsigned int m = threadIdx.x / (ifmap_shape.W * ifmap_shape.W);
+    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+
+    // divide the output window per filter into 4 blocks to avoid memory access conflicts
+    for (int b0=0; b0<2; b0++){
+        for (int b1=0; b1<2; b1++){
+            for (int mm=m_per_thread*m; mm<m_per_thread*(m+1); mm++){
+                for (int k0=b0*2; k0<(b0+1)*2; k0++){
+                    for (int k1=b1*2; k1<(b1+1)*2; k1++){
+                        int output_y = w0*2+k0-pad;
+                        int output_x = w1*2+k1-pad;
+                        if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W && mm<Tm){
+                            ofmap_shared[mm][output_y][output_x] += ifmap[ifmap_index] * filter_shared[mm][k0][k1];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = threadIdx.x; i < Tm*2*W*2*W; i += blockDim.x) {
+        unsigned int ofmap_m = i / (ofmap_shape.W * ofmap_shape.W);
+        unsigned int ofmap_w0 = i % (ofmap_shape.W * ofmap_shape.W) / ofmap_shape.W;
+        unsigned int ofmap_w1 = i % ofmap_shape.W;
+        atomicAdd(&ofmap[get_fmap_index(m_offset+ofmap_m, ofmap_w0, ofmap_w1, ofmap_shape)], ofmap_shared[ofmap_m][ofmap_w0][ofmap_w1]);
+    }
+}
+
 template<int M, int K, int W>
 __global__ 
 void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap, 
@@ -289,7 +369,6 @@ void deconv_kernel_share_filter(float * ifmap, float * filter, float * ofmap,
     }
 }
 
-
 void gpu_deconv(float * ifmap, float * filter, float * ofmap, 
                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape, 
                 unsigned int nIter, unsigned int option)
@@ -298,9 +377,16 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     size_t ifmap_size = ifmap_shape.C*ifmap_shape.W*ifmap_shape.W*sizeof(float);
     size_t filter_size = filter_shape.C*filter_shape.M*filter_shape.K*filter_shape.K*sizeof(float);
     size_t ofmap_size = ofmap_shape.C*ofmap_shape.W*ofmap_shape.W*sizeof(float);
-    gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
-    gpuErrchk(cudaMalloc(&d_filter, filter_size));
-    gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
+    int pinned = 0;
+    if (pinned == 0){
+        gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
+        gpuErrchk(cudaMalloc(&d_filter, filter_size));
+        gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
+    } else {
+        gpuErrchk(cudaMallocHost(&d_ifmap, ifmap_size));
+        gpuErrchk(cudaMallocHost(&d_filter, filter_size));
+        gpuErrchk(cudaMallocHost(&d_ofmap, ofmap_size));
+    }
     gpuErrchk(cudaMemcpy(d_ifmap, ifmap, ifmap_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
@@ -316,7 +402,7 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
-    // tile ifmap
+    // shared ifmap
     else if (option == 1) {
         const unsigned int blockSize = 16;
         dim3 threads(blockSize, blockSize);
@@ -326,20 +412,85 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
-    // tile filter
+    // shared filter 
     else if (option == 2) {
-        // const unsigned int blockSize = ifmap_shape.W;
         dim3 threads(filter_shape.M, filter_shape.K, filter_shape.K);
         dim3 grid(filter_shape.C);
-        int nBlocks = ceil(1.0*ifmap_shape.C*ifmap_shape.W*ifmap_shape.W)/(filter_shape.M*filter_shape.K*filter_shape.K);
         for (int j=0; j<nIter; ++j) {
             deconv_kernel_share_filter<64,4,16> <<< grid, threads >>> 
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
 
         }
     }
-    // tile ofmap
+    // shared filter/ofmap + tiling
     else if (option == 3) {
+        unsigned int threads = 1024;
+        dim3 grid(filter_shape.C);
+        for (int j=0; j<nIter; ++j) {
+            if (filter_shape.M == 256) {
+                // M = 256, W = 4, Tm = 150, remaining Tm = 106
+                const unsigned int W = 4;
+                const unsigned int Tm = 150;
+                const unsigned int remaining_Tm = 106; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else if (filter_shape.M == 128) {
+                // M = 128, W = 8, Tm = 45, remaining Tm = 38
+                const unsigned int W = 8;
+                const unsigned int Tm = 45;
+                const unsigned int remaining_Tm = 38; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else if (filter_shape.M == 64) {
+                // M = 64, W = 16, Tm = 10, remaining Tm = 4
+                const unsigned int W = 16;
+                const unsigned int Tm = 10;
+                const unsigned int remaining_Tm = 4; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else if (filter_shape.M == 3) {
+                // M = 3, W = 32, Tm = 2, remaining Tm = 1
+                const unsigned int W = 32;
+                const unsigned int Tm = 2;
+                const unsigned int remaining_Tm = 1; // M % Tm
+                for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+                    deconv_kernel_share_filter_tiled<Tm, 4, W> <<< grid, threads >>> 
+                        (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+                }
+                deconv_kernel_share_filter_tiled<remaining_Tm, 4, W> <<< grid, threads >>> 
+                    (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+            }
+            else {
+                printf("layer not found\n");
+                exit(1);
+            }
+            // for (int k=0; k<(filter_shape.M+Tm-1)/Tm-1; ++k) {
+            //     deconv_kernel_share_filter_tiled<Tm, 4, 16> <<< grid, threads >>> 
+            //         (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, k*Tm);
+            // }
+            // deconv_kernel_share_filter_tiled<remaining_Tm, 4, 16> <<< grid, threads >>> 
+            //     (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape, ((filter_shape.M+Tm-1)/Tm-1)*Tm);
+
+        }
         
     }
     gpuErrchk(cudaDeviceSynchronize());
@@ -364,9 +515,15 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
         flopsPerConvTranspose);
 
     gpuErrchk(cudaMemcpy(ofmap, d_ofmap, ofmap_size, cudaMemcpyDeviceToHost));
-    gpuErrchk(cudaFree(d_ifmap));
-    gpuErrchk(cudaFree(d_filter));
-    gpuErrchk(cudaFree(d_ofmap));
+    if (pinned == 0){
+    	gpuErrchk(cudaFree(d_ifmap));
+    	gpuErrchk(cudaFree(d_filter));
+    	gpuErrchk(cudaFree(d_ofmap));
+    } else {
+    	gpuErrchk(cudaFreeHost(d_ifmap));
+    	gpuErrchk(cudaFreeHost(d_filter));
+    	gpuErrchk(cudaFreeHost(d_ofmap));
+    }
 }
 
 void ConstantInit(float* arr, int sz, float val) {
