@@ -22,7 +22,7 @@ layer: 0, 1, 2, 3
 - layer 3: (W,C,M) = (32,64,3)
 
 ====================================================================================
-Comparison with ConvTranspose2d in PyTorch (C++ and Python):
+Comparison with ConvTranspose2d in PyTorch (C++ and Python)
 ====================================================================================
 - Instructions to run C++ implementation on NYU CIMS CUDA Cluster (tested on cuda4):
 
@@ -32,6 +32,7 @@ module load gcc-7.4
 module load cuda-10.2
 
 # download and install Pytorch C++ Library
+cd pytorch
 wget https://download.pytorch.org/libtorch/cu102/libtorch-shared-with-deps-1.7.0.zip
 unzip libtorch-shared-with-deps-1.7.0.zip
 
@@ -49,9 +50,5 @@ cmake --build .
 ====================================================================================
 - Instructions to run Python implementation on NYU CIMS CUDA Cluster (tested on cuda4):
 
-# load modules
-module load cuda-10.2
-
-# run 
-python3 pytorch.py [layer]
+python3 pytorch/pytorch.py [layer]
 (layer = 0, 1, 2, 3 same as above)
