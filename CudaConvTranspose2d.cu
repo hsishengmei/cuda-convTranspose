@@ -38,6 +38,7 @@ __host__ __device__ unsigned int get_filter_index(unsigned int d1, unsigned int 
 }
 void cpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 void gpu_deconv(float *, float *, float *, FmapShape, FilterShape, FmapShape, unsigned int, unsigned int);
+void calc_flops(double, unsigned int, unsigned int);
 void print_fmap(float *, FmapShape);
 __global__ void deconv_kernel(float *, float *, float *, FmapShape, FilterShape, FmapShape);
 template<int> __global__ void deconv_kernel_tile_ifmap(float *, float *, float *, FmapShape, FilterShape, FmapShape);
@@ -47,7 +48,7 @@ template<int,int,int> __global__ void deconv_kernel_share_filter_tiled(float *, 
 /*****************************************************************/
 
 // to measure time taken by a specific part of the code 
-double time_taken;
+double seconds;
 clock_t start, end;
 
 int main(int argc, char * argv[])
@@ -125,8 +126,10 @@ int main(int argc, char * argv[])
 
     int nIter = 1000;
     // int nIter = 1;
-
-    gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
+    if (option == 0)
+        cpu_deconv(ifmap, filter, ofmap_cpu, ifmap_shape, filter_shape, ofmap_shape);
+    else
+        gpu_deconv(ifmap, filter, ofmap_gpu, ifmap_shape, filter_shape, ofmap_shape, nIter, option);
 
     // check correctness
     if (nIter == 1) {
@@ -142,7 +145,7 @@ int main(int argc, char * argv[])
         printf("diff to sum ratio: %f\n", abs(diff) / sum);
     
         // print_fmap(ofmap_cpu, ofmap_shape);
-        //print_fmap(ofmap_gpu, ofmap_shape);
+        // print_fmap(ofmap_gpu, ofmap_shape);
     }
 
     free(ifmap);
@@ -157,36 +160,40 @@ int main(int argc, char * argv[])
 void cpu_deconv(float * ifmap, float * filter, float * ofmap, 
                 FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
 {
-    printf("CPU start\n");
     start = clock();
 
-    // assuming stride is always 2, batch size is always 1
     unsigned int pad = (filter_shape.K - 1) / 2;
-    for (int c=0; c<ifmap_shape.C; c++){
-        for (int w0=0; w0<ifmap_shape.W; w0++){
-            for (int w1=0; w1<ifmap_shape.W; w1++){
-                for (int m=0; m<filter_shape.M; m++){
-                    for (int k0=0; k0<filter_shape.K; k0++){
-                        for (int k1=0; k1<filter_shape.K; k1++){
-                            int output_y = w0*2+k0-pad;
-                            int output_x = w1*2+k1-pad;
-                            if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
-                                unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
-                                unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
-                                unsigned int ofmap_index = get_fmap_index(m, output_y, output_x, ofmap_shape);
-                                ofmap[ofmap_index] += ifmap[ifmap_index] * filter[filter_index];
+    int nIter = 10;
+    for (int i=0; i<nIter; ++i) {
+        // assuming stride is always 2, batch size is always 1
+        for (int c=0; c<ifmap_shape.C; c++){
+            for (int w0=0; w0<ifmap_shape.W; w0++){
+                for (int w1=0; w1<ifmap_shape.W; w1++){
+                    for (int m=0; m<filter_shape.M; m++){
+                        for (int k0=0; k0<filter_shape.K; k0++){
+                            for (int k1=0; k1<filter_shape.K; k1++){
+                                int output_y = w0*2+k0-pad;
+                                int output_x = w1*2+k1-pad;
+                                if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W){
+                                    unsigned int ifmap_index = get_fmap_index(c, w0, w1, ifmap_shape);
+                                    unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
+                                    unsigned int ofmap_index = get_fmap_index(m, output_y, output_x, ofmap_shape);
+                                    ofmap[ofmap_index] += ifmap[ifmap_index] * filter[filter_index];
+                                }
                             }
-                        }
+                        } 
                     } 
-                } 
+                }
             }
         }
     }
-    
+
     end = clock();
-    printf("CPU end\n");
-    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
-    printf("Time taken for CPU is %lf\n", time_taken);
+    seconds = ((double)(end - start))/ CLOCKS_PER_SEC;
+    unsigned int opsPerConvTranspose = 2 * ifmap_shape.C *ifmap_shape.W * ifmap_shape.W *
+                                            filter_shape.M * filter_shape.K * filter_shape.K;
+
+    calc_flops(seconds, opsPerConvTranspose, nIter);
 }
 
 __global__ 
@@ -215,57 +222,6 @@ void deconv_kernel(float * ifmap, float * filter, float * ofmap,
             }
         } 
     } 
-}
-
-
-template<int BLOCK_SIZE>
-__global__ 
-void deconv_kernel_tile_ifmap(float * ifmap, float * filter, float * ofmap, 
-						    FmapShape ifmap_shape, FilterShape filter_shape, FmapShape ofmap_shape)
-{
-	// block index
-	unsigned int b0 = blockIdx.x;
-	unsigned int b1 = blockIdx.y;
-	unsigned int b2 = blockIdx.z;
-	
-	// thread index
-	unsigned int t0 = threadIdx.x;
-	unsigned int t1 = threadIdx.y;
-
-	// input channel, fixed
-	unsigned int c = b0;
-	// kernel index
-	// unsigned int w0_start = b1*BLOCK_SIZE + t0;
-	// unsigned int w0_end = ifmap_shape.W;
-	// unsigned int w1_start = b2*BLOCK_SIZE + t1;
-	// unsigned int w1_end = ifmap_shape.W;
-	unsigned int w0 = b1*BLOCK_SIZE + t0;
-	unsigned int w1 = b2*BLOCK_SIZE + t1;
-
-    unsigned int pad = (filter_shape.K - 1) / 2;
-
-    // load ifmap tile
-    __shared__ float In[BLOCK_SIZE][BLOCK_SIZE];
-    In[t0][t1] = ifmap[get_fmap_index(c, w0, w1, ifmap_shape)];
-    // __syncthreads();
-
-
-    for (int k0=0; k0<filter_shape.K; ++k0) {
-        for (int k1=0; k1<filter_shape.K; ++k1) {
-            int output_y = w0*2+k0-pad;
-            int output_x = w1*2+k1-pad;
-            if (output_x >= 0 && output_y >= 0 && output_x < ofmap_shape.W && output_y < ofmap_shape.W) {
-                for (int m=0; m<filter_shape.M; ++m) {
-                    unsigned int filter_index = get_filter_index(c, m, k0, k1, filter_shape);
-                    unsigned int ofmap_index = get_fmap_index(m, output_y, output_x, ofmap_shape);
-                    
-                    //ofmap[ofmap_index] += ifmap[ifmap_index] * filter[filter_index];
-                    atomicAdd(&ofmap[ofmap_index], In[t0][t1] * filter[filter_index]);
-                }
-            }
-        }
-    }
-	
 }
 
 // share filter & input
@@ -377,16 +333,11 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     size_t ifmap_size = ifmap_shape.C*ifmap_shape.W*ifmap_shape.W*sizeof(float);
     size_t filter_size = filter_shape.C*filter_shape.M*filter_shape.K*filter_shape.K*sizeof(float);
     size_t ofmap_size = ofmap_shape.C*ofmap_shape.W*ofmap_shape.W*sizeof(float);
-    int pinned = 0;
-    if (pinned == 0){
-        gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
-        gpuErrchk(cudaMalloc(&d_filter, filter_size));
-        gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
-    } else {
-        gpuErrchk(cudaMallocHost(&d_ifmap, ifmap_size));
-        gpuErrchk(cudaMallocHost(&d_filter, filter_size));
-        gpuErrchk(cudaMallocHost(&d_ofmap, ofmap_size));
-    }
+
+    gpuErrchk(cudaMalloc(&d_ifmap, ifmap_size));
+    gpuErrchk(cudaMalloc(&d_filter, filter_size));
+    gpuErrchk(cudaMalloc(&d_ofmap, ofmap_size));
+   
     gpuErrchk(cudaMemcpy(d_ifmap, ifmap, ifmap_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_filter, filter, filter_size, cudaMemcpyHostToDevice));
     gpuErrchk(cudaMemcpy(d_ofmap, ofmap, ofmap_size, cudaMemcpyHostToDevice));
@@ -395,20 +346,10 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     start = clock();
 
     // naive impl
-    if (option == 0) {
+    if (option == 1) {
         int nBlocks = ceil(1.0*ifmap_shape.C*ifmap_shape.W*ifmap_shape.W)/1024;
         for (int j=0; j<nIter; ++j) {
             deconv_kernel <<< nBlocks, 1024 >>> 
-                (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
-        }
-    }
-    // shared ifmap
-    else if (option == 1) {
-        const unsigned int blockSize = 16;
-        dim3 threads(blockSize, blockSize);
-        dim3 grid(ifmap_shape.C, ifmap_shape.W / threads.x, ifmap_shape.W / threads.y);
-        for (int j=0; j<nIter; ++j) {
-            deconv_kernel_tile_ifmap<blockSize> <<< grid, threads >>> 
                 (d_ifmap, d_filter, d_ofmap, ifmap_shape, filter_shape, ofmap_shape);
         }
     }
@@ -497,41 +438,28 @@ void gpu_deconv(float * ifmap, float * filter, float * ofmap,
     
     end = clock();
     
-    time_taken = ((double)(end - start))/ CLOCKS_PER_SEC;
+    seconds = ((double)(end - start))/ CLOCKS_PER_SEC;
     
-    double flopsPerConvTranspose = 2.0 * static_cast<double>(ifmap_shape.C) *
-                                        static_cast<double>(ifmap_shape.W) *
-                                        static_cast<double>(ifmap_shape.W) *
-                                        static_cast<double>(filter_shape.M) *
-                                        static_cast<double>(filter_shape.K) *
-                                        static_cast<double>(filter_shape.K);
+    unsigned int opsPerConvTranspose = 2 * ifmap_shape.C *ifmap_shape.W * ifmap_shape.W *
+                                            filter_shape.M * filter_shape.K * filter_shape.K;
 
-    double gigaFlops = (flopsPerConvTranspose * 1.0e-9f) * nIter / time_taken;
-    printf(
-        "Performance=%.2f GFlop/s, Iterations=%d, Total Time=%.3f msec, Size=%.0f Ops\n",
-        gigaFlops,
-        nIter,
-        time_taken,
-        flopsPerConvTranspose);
+    calc_flops(seconds, opsPerConvTranspose, nIter);
 
     gpuErrchk(cudaMemcpy(ofmap, d_ofmap, ofmap_size, cudaMemcpyDeviceToHost));
-    if (pinned == 0){
-    	gpuErrchk(cudaFree(d_ifmap));
-    	gpuErrchk(cudaFree(d_filter));
-    	gpuErrchk(cudaFree(d_ofmap));
-    } else {
-    	gpuErrchk(cudaFreeHost(d_ifmap));
-    	gpuErrchk(cudaFreeHost(d_filter));
-    	gpuErrchk(cudaFreeHost(d_ofmap));
-    }
+
+    gpuErrchk(cudaFree(d_ifmap));
+    gpuErrchk(cudaFree(d_filter));
+    gpuErrchk(cudaFree(d_ofmap));
 }
 
-void ConstantInit(float* arr, int sz, float val) {
-    for (int i=0; i<sz; ++i)
-        arr[i] = val;
+void calc_flops(double seconds, unsigned int opsPerConvTranspose, unsigned int nIter) {
+    double gigaFlops = 1.0 * (opsPerConvTranspose * 1.0e-9f) * nIter / seconds;
+    printf("Iterations=%d, Total Time=%.2f seconds, Ops per Iteration=%d\n", nIter, seconds, opsPerConvTranspose);
+    printf("Performance=%.2f GFlop/sec\n", gigaFlops);
+    printf("Average time per iteration=%.2f msec\n\n", seconds * 1000 / nIter);
 }
 
-void print_fmap(float * fmap, FmapShape fmap_shape){
+void print_fmap(float * fmap, FmapShape fmap_shape) {
     printf("%d %d %d\n", fmap_shape.C, fmap_shape.W, fmap_shape.W);
     for (int c = 0; c < fmap_shape.C; c++) {
         for (int w0 = 0; w0 < fmap_shape.W; w0++) {
